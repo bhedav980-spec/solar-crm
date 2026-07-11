@@ -915,6 +915,9 @@ function downloadCSV(filename, rows) {
 
 // ─── STORAGE ────────────────────────────────────────────────────────────────
 const SK = "rs_solar_crm_v4";
+const SUPABASE_URL = "https://bsvxqhxyexhbgysnfgal.supabase.co";
+const SUPABASE_KEY = "sb_publishable_yg-F8bDfTJEZPAHr38TwJw_Yue23cpg";
+const CLOUD_ROW_ID = "main";
 const DEF = {
   customers: [],
   quotes: [],
@@ -943,18 +946,47 @@ const DEF = {
 };
 async function loadD() {
   try {
-    const r = localStorage.getItem(SK);
-    return r ? {
-      ...DEF,
-      ...JSON.parse(r)
-    } : DEF;
-  } catch {
-    return DEF;
+    const response = await fetch(`${SUPABASE_URL}/rest/v1/crm_state?id=eq.${CLOUD_ROW_ID}&select=data`, {
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`
+      },
+      cache: "no-store"
+    });
+    if (!response.ok) throw new Error(`Cloud load failed: ${response.status}`);
+    const rows = await response.json();
+    if (rows.length && rows[0].data) return { ...DEF, ...rows[0].data };
+
+    // First run: upload this device's existing data, if any.
+    const old = localStorage.getItem(SK);
+    const initial = old ? { ...DEF, ...JSON.parse(old) } : DEF;
+    await saveD(initial);
+    return initial;
+  } catch (error) {
+    console.error("Cloud load failed", error);
+    const old = localStorage.getItem(SK);
+    return old ? { ...DEF, ...JSON.parse(old) } : DEF;
   }
 }
 async function saveD(d) {
   try {
+    // Local copy is retained only as an offline backup.
     localStorage.setItem(SK, JSON.stringify(d));
+    const response = await fetch(`${SUPABASE_URL}/rest/v1/crm_state?on_conflict=id`, {
+      method: "POST",
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "resolution=merge-duplicates,return=minimal"
+      },
+      body: JSON.stringify({
+        id: CLOUD_ROW_ID,
+        data: d,
+        updated_at: new Date().toISOString()
+      })
+    });
+    if (!response.ok) throw new Error(`Cloud save failed: ${response.status} ${await response.text()}`);
   } catch (e) {
     console.error("Save failed", e);
   }
