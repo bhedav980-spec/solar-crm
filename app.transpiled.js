@@ -919,7 +919,54 @@ const SUPABASE_URL = "https://bsvxqhxyexhbgysnfgal.supabase.co";
 const SUPABASE_KEY = "sb_publishable_yg-F8bDfTJEZPAHr38TwJw_Yue23cpg";
 const CLOUD_ROW_ID = "main";
 const OWNER_EMAIL = "bhedav980@gmail.com";
+const OWNER_UID = "a0994734-0a44-4bad-8204-68469d916b33";
 const AUTH_TOKEN_KEY = "rs_supabase_access_token";
+const AUTH_REFRESH_KEY = "rs_supabase_refresh_token";
+const RECOVERY_KEY = "rs_cloud_recovery_v1_done";
+function mergeMissingRecords(cloud, local) {
+  const merged = { ...DEF, ...cloud };
+  let recovered = 0;
+  ["customers", "quotes", "projects", "dealers", "inventory", "expenses"].forEach(key => {
+    const cloudRows = Array.isArray(cloud?.[key]) ? cloud[key] : [];
+    const localRows = Array.isArray(local?.[key]) ? local[key] : [];
+    const ids = new Set(cloudRows.map(x => x.id));
+    const missing = localRows.filter(x => x?.id && !ids.has(x.id));
+    recovered += missing.length;
+    merged[key] = [...cloudRows, ...missing];
+  });
+  merged.counters = {
+    QT: Math.max(Number(cloud?.counters?.QT || 0), Number(local?.counters?.QT || 0)),
+    PR: Math.max(Number(cloud?.counters?.PR || 0), Number(local?.counters?.PR || 0)),
+    INV: Math.max(Number(cloud?.counters?.INV || 0), Number(local?.counters?.INV || 0))
+  };
+  return { merged, recovered };
+}
+async function getValidToken() {
+  const token = localStorage.getItem(AUTH_TOKEN_KEY);
+  const refresh = localStorage.getItem(AUTH_REFRESH_KEY);
+  if (token) {
+    try {
+      const payload = JSON.parse(atob(token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
+      if (payload.exp && payload.exp * 1000 > Date.now() + 120000) return token;
+    } catch {}
+  }
+  if (!refresh) return token;
+  try {
+    const response = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`, {
+      method: "POST",
+      headers: { apikey: SUPABASE_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ refresh_token: refresh })
+    });
+    if (!response.ok) return token;
+    const auth = await response.json();
+    if (auth.access_token) localStorage.setItem(AUTH_TOKEN_KEY, auth.access_token);
+    if (auth.refresh_token) localStorage.setItem(AUTH_REFRESH_KEY, auth.refresh_token);
+    return auth.access_token || token;
+  } catch { return token; }
+}
+window.getSupabaseToken = getValidToken;
+let cloudSaveQueue = Promise.resolve();
+let cloudSaveSequence = 0;
 const DEF = {
   customers: [],
   quotes: [],
@@ -948,7 +995,7 @@ const DEF = {
 };
 async function loadD() {
   try {
-    const token = localStorage.getItem(AUTH_TOKEN_KEY);
+    const token = await getValidToken();
     if (!token) return { ...DEF, loggedIn: false };
     const response = await fetch(`${SUPABASE_URL}/rest/v1/crm_state?id=eq.${CLOUD_ROW_ID}&select=data`, {
       headers: {
@@ -959,7 +1006,27 @@ async function loadD() {
     });
     if (!response.ok) throw new Error(`Cloud load failed: ${response.status}`);
     const rows = await response.json();
-    if (rows.length && rows[0].data) return { ...DEF, ...rows[0].data };
+    if (rows.length && rows[0].data) {
+      const cloudData = { ...DEF, ...rows[0].data, loggedIn: true };
+      if (!cloudData.user) cloudData.user = cloudData.team?.[0]?.id || "u1";
+      if (!localStorage.getItem(RECOVERY_KEY)) {
+        try {
+          const old = JSON.parse(localStorage.getItem(SK) || "null");
+          if (old) {
+            const recovery = mergeMissingRecords(cloudData, old);
+            if (recovery.recovered > 0) {
+              await saveD(recovery.merged);
+              localStorage.setItem(RECOVERY_KEY, "1");
+              alert(`${recovery.recovered} purane local record cloud mein recover ho gaye.`);
+              return recovery.merged;
+            }
+          }
+        } catch (error) { console.error("Local recovery skipped", error); }
+        localStorage.setItem(RECOVERY_KEY, "1");
+      }
+      localStorage.setItem(SK, JSON.stringify(cloudData));
+      return cloudData;
+    }
 
     // First run: upload this device's existing data, if any.
     const old = localStorage.getItem(SK);
@@ -972,30 +1039,46 @@ async function loadD() {
     return old ? { ...DEF, ...JSON.parse(old) } : DEF;
   }
 }
-async function saveD(d) {
-  try {
-    // Local copy is retained only as an offline backup.
-    localStorage.setItem(SK, JSON.stringify(d));
-    const token = localStorage.getItem(AUTH_TOKEN_KEY);
-    if (!token) return;
-    const response = await fetch(`${SUPABASE_URL}/rest/v1/crm_state?on_conflict=id`, {
-      method: "POST",
+async function saveCloudSnapshot(d, sequence) {
+    const token = await getValidToken();
+    if (!token) throw new Error("Login expired. Please login again.");
+    const response = await fetch(`${SUPABASE_URL}/rest/v1/crm_state?id=eq.${CLOUD_ROW_ID}`, {
+      method: "PATCH",
       headers: {
         apikey: SUPABASE_KEY,
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
-        Prefer: "resolution=merge-duplicates,return=minimal"
+        Prefer: "return=representation"
       },
       body: JSON.stringify({
-        id: CLOUD_ROW_ID,
         data: d,
         updated_at: new Date().toISOString()
       })
     });
     if (!response.ok) throw new Error(`Cloud save failed: ${response.status} ${await response.text()}`);
-  } catch (e) {
-    console.error("Save failed", e);
-  }
+    let rows = await response.json();
+    if (!Array.isArray(rows) || rows.length !== 1) {
+      const createResponse = await fetch(`${SUPABASE_URL}/rest/v1/crm_state`, {
+        method: "POST",
+        headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${token}`, "Content-Type": "application/json", Prefer: "return=representation" },
+        body: JSON.stringify({ id: CLOUD_ROW_ID, data: d, owner_id: OWNER_UID, updated_at: new Date().toISOString() })
+      });
+      if (!createResponse.ok) throw new Error(`Cloud row create failed: ${createResponse.status} ${await createResponse.text()}`);
+      rows = await createResponse.json();
+      if (!Array.isArray(rows) || rows.length !== 1) throw new Error("Cloud row was not saved. Owner access check failed.");
+    }
+    localStorage.setItem(SK, JSON.stringify(d));
+    window.dispatchEvent(new CustomEvent("crm-cloud-saved", { detail: { sequence } }));
+    return true;
+}
+function saveD(d) {
+  const snapshot = JSON.parse(JSON.stringify(d));
+  const sequence = ++cloudSaveSequence;
+  localStorage.setItem(SK, JSON.stringify(snapshot));
+  window.dispatchEvent(new CustomEvent("crm-cloud-saving", { detail: { sequence } }));
+  const task = () => saveCloudSnapshot(snapshot, sequence);
+  cloudSaveQueue = cloudSaveQueue.then(task, task);
+  return cloudSaveQueue;
 }
 
 // ─── DESIGN TOKENS ───────────────────────────────────────────────────────────
@@ -1372,6 +1455,7 @@ function Login({
       const auth = await response.json();
       if (!response.ok || !auth.access_token) throw new Error(auth.error_description || auth.msg || "Login failed");
       localStorage.setItem(AUTH_TOKEN_KEY, auth.access_token);
+      if (auth.refresh_token) localStorage.setItem(AUTH_REFRESH_KEY, auth.refresh_token);
       location.reload();
     } catch (error) {
       setErr(error.message || "Email ya password galat hai.");
@@ -1514,7 +1598,13 @@ function App() {
   }, []);
   const persist = useCallback(d => {
     setData(d);
-    saveD(d);
+    return saveD(d).then(() => true).catch(error => {
+      console.error("SAVE ERROR", error);
+      window.dispatchEvent(new CustomEvent("crm-cloud-error", { detail: { message: error.message } }));
+      alert(`Data cloud mein save nahi hua.\n${error.message}\nPage refresh mat karein; dobara try karein.`);
+      loadD().then(cloudData => setData(cloudData));
+      return false;
+    });
   }, []);
   if (loading || !data) return /*#__PURE__*/React.createElement("div", {
     style: {
@@ -1579,7 +1669,7 @@ function App() {
       ...p,
       [k]: e.target.value
     }));
-    function save() {
+    async function save() {
       if (!f.name || !f.phone) return alert("Name & Phone required");
       const customers = ed ? data.customers.map(c => c.id === doc.id ? {
         ...f
@@ -1589,11 +1679,11 @@ function App() {
         createdAt: today(),
         createdBy: me.id
       }, ...data.customers];
-      persist({
+      const saved = await persist({
         ...data,
         customers
       });
-      onClose();
+      if (saved) onClose();
     }
     return /*#__PURE__*/React.createElement(Modal, {
       title: ed ? "Edit Customer" : "New Customer",
@@ -1740,7 +1830,7 @@ function App() {
     const basePrice = overridePrice !== null ? Number(overridePrice) : basePriceCalc;
     const sub = calcSubsidy(kw);
     const brands = f.panelType === "BIFACIAL" ? ["ADANI", "WAAREE", "APS"] : ["PAHAL", "ADANI", "WAAREE", "APS"];
-    function create() {
+    async function create() {
       if (!f.customerId) return alert("Please select a customer");
       if (!basePrice) return alert("Invalid panel selection");
       const cust = getCust(f.customerId);
@@ -1783,7 +1873,7 @@ function App() {
         createdBy: me.id,
         createdAt: today()
       };
-      persist({
+      const saved = await persist({
         ...data,
         quotes: [q, ...data.quotes],
         dealers,
@@ -1792,7 +1882,10 @@ function App() {
           QT: n
         }
       });
-      onClose();
+      if (saved) {
+        alert(`Quotation ${q.ref} cloud mein save ho gaya.`);
+        onClose();
+      }
     }
     return /*#__PURE__*/React.createElement(Modal, {
       title: "Generate Quotation",
@@ -3553,7 +3646,7 @@ function App() {
   }
 
   // ── CREATE PROJECT FROM QUOTE ────────────────────────────────────────────────
-  function createProject(q) {
+  async function createProject(q) {
     if (data.projects.find(p => p.quoteId === q.id)) return alert("Project already exists for this quote!");
     const n = data.counters.PR + 1;
     const proj = {
@@ -3599,7 +3692,7 @@ function App() {
       ...qt,
       status: "Project Created"
     } : qt);
-    persist({
+    const saved = await persist({
       ...data,
       projects: [proj, ...data.projects],
       quotes,
@@ -3608,6 +3701,8 @@ function App() {
         PR: n
       }
     });
+    if (saved) alert(`Project ${proj.ref} create hokar cloud mein save ho gaya.`);
+    return saved;
   }
 
   // ── DASHBOARD ──────────────────────────────────────────────────────────────
@@ -4184,15 +4279,20 @@ function App() {
             border: `1px solid ${BORDER}`
           },
           value: q.status,
-          onChange: e => persist({
-            ...data,
-            quotes: data.quotes.map(qt => qt.id === q.id ? {
-              ...qt,
-              status: e.target.value
-            } : qt)
-          })
+          onChange: e => {
+            const nextStatus = e.target.value;
+            if (nextStatus === "Approved") return createProject(q);
+            return persist({
+              ...data,
+              quotes: data.quotes.map(qt => qt.id === q.id ? {
+                ...qt,
+                status: nextStatus
+              } : qt)
+            });
+          }
         }, ["Draft", "Sent", "Approved", "Rejected", "Project Created"].map(s => /*#__PURE__*/React.createElement("option", {
-          key: s
+          key: s,
+          disabled: s === "Project Created"
         }, s)))), /*#__PURE__*/React.createElement("td", {
           style: {
             padding: "14px 16px",
@@ -5085,7 +5185,7 @@ function App() {
         ...BS,
         ...SMALL
       },
-      onClick: () => downloadCSV("inventory.csv", [["Date", "Item", "Brand", "Qty", "Unit", "Rate", "Amount", "Used", "Remaining"], ...data.inventory.map(i => [i.date, i.item, i.brand, i.qty, i.unit, i.rate, i.amount, i.used || 0, Number(i.qty) - Number(i.used || 0)])])
+      onClick: () => downloadCSV("inventory.csv", [["Date", "Invoice", "Batch", "Supplier", "Item", "Brand", "Qty", "Unit", "Rate", "Amount", "Used", "Remaining"], ...data.inventory.map(i => [i.date, i.invoiceNo || "", i.batch || "", i.supplier || "", i.item, i.brand, i.qty, i.unit, i.rate, i.amount, i.used || 0, Number(i.qty) - Number(i.used || 0)])])
     }, /*#__PURE__*/React.createElement(DlIc, {
       size: 13
     }), " Export CSV")), data.inventory.length === 0 ? /*#__PURE__*/React.createElement("div", {
@@ -5141,7 +5241,9 @@ function App() {
           color: TXT,
           fontWeight: 600
         }
-      }, i.item), /*#__PURE__*/React.createElement("td", {
+      }, i.item, i.invoiceNo && /*#__PURE__*/React.createElement("div", {
+        style: { fontSize: "10px", color: TXT3, marginTop: "3px", fontWeight: 500 }
+      }, i.invoiceNo, i.batch ? ` · Batch ${i.batch}` : "", i.supplier ? ` · ${i.supplier}` : "")), /*#__PURE__*/React.createElement("td", {
         style: {
           padding: "12px 16px",
           color: TXT2
@@ -6013,10 +6115,11 @@ function App() {
     label: `${me.name} • ${me.role === "admin" ? "Admin" : "Partner"}${me.district ? ` (${me.district})` : ""}`,
     color: BLUE
   }), /*#__PURE__*/React.createElement("button", {
-    onClick: () => persist({
-      ...data,
-      loggedIn: false
-    }),
+    onClick: () => {
+      localStorage.removeItem(AUTH_TOKEN_KEY);
+      localStorage.removeItem(AUTH_REFRESH_KEY);
+      location.reload();
+    },
     style: {
       ...BS,
       ...SMALL
