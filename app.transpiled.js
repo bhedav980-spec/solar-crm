@@ -918,6 +918,8 @@ const SK = "rs_solar_crm_v4";
 const SUPABASE_URL = "https://bsvxqhxyexhbgysnfgal.supabase.co";
 const SUPABASE_KEY = "sb_publishable_yg-F8bDfTJEZPAHr38TwJw_Yue23cpg";
 const CLOUD_ROW_ID = "main";
+const OWNER_EMAIL = "bhedav980@gmail.com";
+const AUTH_TOKEN_KEY = "rs_supabase_access_token";
 const DEF = {
   customers: [],
   quotes: [],
@@ -946,10 +948,12 @@ const DEF = {
 };
 async function loadD() {
   try {
+    const token = localStorage.getItem(AUTH_TOKEN_KEY);
+    if (!token) return { ...DEF, loggedIn: false };
     const response = await fetch(`${SUPABASE_URL}/rest/v1/crm_state?id=eq.${CLOUD_ROW_ID}&select=data`, {
       headers: {
         apikey: SUPABASE_KEY,
-        Authorization: `Bearer ${SUPABASE_KEY}`
+        Authorization: `Bearer ${token}`
       },
       cache: "no-store"
     });
@@ -972,11 +976,13 @@ async function saveD(d) {
   try {
     // Local copy is retained only as an offline backup.
     localStorage.setItem(SK, JSON.stringify(d));
+    const token = localStorage.getItem(AUTH_TOKEN_KEY);
+    if (!token) return;
     const response = await fetch(`${SUPABASE_URL}/rest/v1/crm_state?on_conflict=id`, {
       method: "POST",
       headers: {
         apikey: SUPABASE_KEY,
-        Authorization: `Bearer ${SUPABASE_KEY}`,
+        Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
         Prefer: "resolution=merge-duplicates,return=minimal"
       },
@@ -1354,16 +1360,22 @@ function Login({
   const [pin, setPin] = useState("");
   const [err, setErr] = useState("");
   const selMember = data.team.find(t => t.id === sel);
-  function doLogin() {
-    if (selMember?.pin && pin !== selMember.pin) {
-      setErr("Galat security code. Phir try karo.");
-      return;
+  async function doLogin() {
+    if (!pin) return setErr("Password daalein.");
+    setErr("");
+    try {
+      const response = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
+        method: "POST",
+        headers: { apikey: SUPABASE_KEY, "Content-Type": "application/json" },
+        body: JSON.stringify({ email: OWNER_EMAIL, password: pin })
+      });
+      const auth = await response.json();
+      if (!response.ok || !auth.access_token) throw new Error(auth.error_description || auth.msg || "Login failed");
+      localStorage.setItem(AUTH_TOKEN_KEY, auth.access_token);
+      location.reload();
+    } catch (error) {
+      setErr(error.message || "Email ya password galat hai.");
     }
-    persist({
-      ...data,
-      user: sel,
-      loggedIn: true
-    });
   }
   return /*#__PURE__*/React.createElement("div", {
     style: {
@@ -1426,7 +1438,7 @@ function Login({
       textAlign: "left"
     }
   }, /*#__PURE__*/React.createElement(Fld, {
-    label: "Select Your Profile"
+    label: "Admin Email"
   }, /*#__PURE__*/React.createElement("select", {
     style: SS,
     value: sel,
@@ -1435,22 +1447,20 @@ function Login({
       setPin("");
       setErr("");
     }
-  }, data.team.map(t => /*#__PURE__*/React.createElement("option", {
-    key: t.id,
-    value: t.id
-  }, t.name, " \u2014 ", t.role === "admin" ? "Admin" : "District Partner", t.district ? ` (${t.district})` : "")))), selMember?.pin && /*#__PURE__*/React.createElement(Fld, {
-    label: "Security Code"
+  }, /*#__PURE__*/React.createElement("option", {
+    key: "owner",
+    value: sel
+  }, OWNER_EMAIL))), /*#__PURE__*/React.createElement(Fld, {
+    label: "Password"
   }, /*#__PURE__*/React.createElement("input", {
     style: IS,
     type: "password",
-    inputMode: "numeric",
-    maxLength: 6,
     value: pin,
     onChange: e => {
       setPin(e.target.value);
       setErr("");
     },
-    placeholder: "Apna code daalein",
+    placeholder: "Supabase account password",
     onKeyDown: e => e.key === "Enter" && doLogin()
   })), err && /*#__PURE__*/React.createElement("div", {
     style: {
@@ -1482,7 +1492,7 @@ function Login({
       fontSize: "12px",
       marginTop: "18px"
     }
-  }, "Security code \u2014 set karo Team tab se (Admin login ke baad)")));
+  }, "Secure Supabase Owner Login")));
 }
 
 // ═══════════════════════════════ MAIN APP ═════════════════════════════════════
